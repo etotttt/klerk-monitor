@@ -1,9 +1,7 @@
 name: Klerk spam monitor
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"   # каждые 5 минут
-  workflow_dispatch:         # ручной запуск из интерфейса GitHub
+  workflow_dispatch:         # только ручной запуск из интерфейса GitHub
 
 jobs:
   monitor:
