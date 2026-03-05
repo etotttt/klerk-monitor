@@ -70,20 +70,24 @@ log = logging.getLogger(__name__)
 
 # --- Хранение просмотренных ID ---
 
-def load_seen_ids() -> set:
+def load_last_id() -> int:
     if not os.path.exists(SEEN_IDS_FILE):
-        return set()
+        return 0
     try:
         with open(SEEN_IDS_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
-    except (json.JSONDecodeError, OSError) as e:
-        log.warning("Не удалось прочитать %s: %s. Начинаем с пустого набора.", SEEN_IDS_FILE, e)
-        return set()
+            data = json.load(f)
+            # поддержка старого формата (список)
+            if isinstance(data, list):
+                return max((int(x) for x in data), default=0)
+            return int(data.get("last_id", 0))
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        log.warning("Не удалось прочитать %s: %s. Начинаем с 0.", SEEN_IDS_FILE, e)
+        return 0
 
 
-def save_seen_ids(ids: set) -> None:
+def save_last_id(last_id: int) -> None:
     with open(SEEN_IDS_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(ids), f, ensure_ascii=False)
+        json.dump({"last_id": last_id}, f, ensure_ascii=False)
 
 
 # --- Получение комментариев через API ---
@@ -188,29 +192,40 @@ def notify_bitrix(text: str, url: str) -> None:
 
 # --- Один цикл проверки ---
 
-def run_once(client: Groq, seen_ids: set) -> None:
+def run_once(client: Groq, last_id: int, cycle_no: int) -> int:
+    sep = "═" * 50
+    log.info("%s", sep)
+    log.info(" Цикл #%d | %s", cycle_no, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("%s", sep)
+
     comments = fetch_comments()
-    new_comments = [c for c in comments if c["id"] not in seen_ids]
+    new_comments = [c for c in comments if int(c["id"]) > last_id]
 
     if not new_comments:
         log.info("Новых комментариев нет.")
-        return
+        return last_id
 
-    log.info("Новых комментариев для проверки: %d", len(new_comments))
+    total = len(new_comments)
+    log.info("Новых комментариев для проверки: %d", total)
 
-    for comment in new_comments:
-        seen_ids.add(comment["id"])
-
+    new_last_id = last_id
+    for i, comment in enumerate(new_comments, start=1):
         spam = is_spam(comment["text"], client)
-        verdict = "SPAM" if spam else "ok  "
-        print(f"[{verdict}] id={comment['id']} | {comment['text'][:120]}", flush=True)
+        new_last_id = max(new_last_id, int(comment["id"]))
+
         if spam:
+            log.info("[%d/%d] id=%s | SPAM", i, total, comment["id"])
+            log.info("        Текст: %s", comment["text"][:200])
+            log.info("        Статья: %s", comment["article_url"] or "неизвестна")
             log_spam(comment["text"], comment["article_url"])
+        else:
+            log.info("[%d/%d] id=%s | ok | %s", i, total, comment["id"], comment["text"][:100])
 
         # Задержка между запросами к Groq
         time.sleep(random.uniform(*GROQ_DELAY))
 
-    save_seen_ids(seen_ids)
+    save_last_id(new_last_id)
+    return new_last_id
 
 
 # --- Точка входа ---
@@ -224,22 +239,23 @@ def main() -> None:
         )
 
     client = Groq(api_key=api_key)
-    seen_ids = load_seen_ids()
+    last_id = load_last_id()
+    cycle_no = 1
 
     # RUN_ONCE=1 используется в GitHub Actions — один запуск и выход
     if os.environ.get("RUN_ONCE"):
         log.info("Режим одного запуска (GitHub Actions).")
-        run_once(client, seen_ids)
+        run_once(client, last_id, cycle_no)
         return
 
     log.info("Мониторинг запущен. Интервал: %d сек. Модель: %s", INTERVAL, MODEL)
 
     while True:
         try:
-            run_once(client, seen_ids)
+            last_id = run_once(client, last_id, cycle_no)
+            cycle_no += 1
         except KeyboardInterrupt:
             log.info("Остановлено пользователем.")
-            save_seen_ids(seen_ids)
             break
         except Exception as e:
             log.error("Непредвиденная ошибка: %s", e, exc_info=True)
